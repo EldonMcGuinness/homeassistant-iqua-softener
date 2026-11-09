@@ -1,6 +1,7 @@
 from .iqua import (
     IquaSoftener,
     IquaSoftenerException,
+    IquaRateLimitException,
     IquaSoftenerData,
     IquaSoftenerState,
     IquaSoftenerVolumeUnit,

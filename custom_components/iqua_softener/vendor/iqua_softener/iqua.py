@@ -2,12 +2,15 @@ import logging
 import time
 import json
 import os
+import random
 import threading
 import asyncio
 from enum import Enum, IntEnum
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional, Dict, Any, Callable
+from urllib.parse import urlsplit
 
 try:
     from zoneinfo import ZoneInfo
@@ -30,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_API_BASE_URL = "https://api.myiquaapp.com/v1"
+RATE_LIMIT_MIN_BACKOFF_SECONDS = 60
+RATE_LIMIT_MAX_BACKOFF_SECONDS = 60 * 60
 
 
 class IquaSoftenerState(str, Enum):
@@ -44,6 +49,14 @@ class IquaSoftenerVolumeUnit(IntEnum):
 
 class IquaSoftenerException(Exception):
     pass
+
+
+class IquaRateLimitException(IquaSoftenerException):
+    """Raised when the API is rate limited or a shared cooldown is active."""
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = max(0.0, retry_after)
 
 
 @dataclass(frozen=True)
@@ -81,6 +94,13 @@ class IquaSoftener:
         self._device_serial_number = device_serial_number
         self._product_serial_number = product_serial_number
         self._api_base_url: str = api_base_url
+
+        # requests.Session and the rate-limit state are shared with the
+        # Home Assistant polling worker and the WebSocket worker thread.
+        self._api_lock = threading.RLock()
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until = 0.0
+        self._rate_limit_count = 0
         
         # Validate that at least one serial number is provided
         if not device_serial_number and not product_serial_number:
@@ -114,6 +134,12 @@ class IquaSoftener:
     @property
     def product_serial_number(self) -> Optional[str]:
         return self._product_serial_number
+
+    @property
+    def rate_limit_cooldown_remaining(self) -> float:
+        """Return the remaining shared API cooldown in seconds."""
+        with self._rate_limit_lock:
+            return max(0.0, self._rate_limit_until - time.monotonic())
 
     def get_data(self) -> IquaSoftenerData:
         device_id = self._get_device_id()
@@ -330,6 +356,8 @@ class IquaSoftener:
                 return valve_data.get("is_installed", False)
             
             return False
+        except IquaRateLimitException:
+            raise
         except Exception as e:
             logger.error(f"Error checking water shutoff valve availability: {e}")
             return False
@@ -391,17 +419,20 @@ class IquaSoftener:
 
     def get_websocket_uri(self) -> Optional[str]:
         """Get WebSocket URI for external use (like Home Assistant integration)."""
-        try:
-            device_id = self._get_device_id()
-            response = self._request("GET", f"/devices/{device_id}/live")
-            data = response.json()
-            ws_uri = data.get("websocket_uri")
-            if ws_uri:
-                return f"wss://api.myiquaapp.com{ws_uri}"
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get WebSocket URI: {e}")
-            return None
+        ws_uri = self._fetch_websocket_uri()
+        if ws_uri:
+            return (
+                ws_uri
+                if ws_uri.startswith(("ws://", "wss://"))
+                else f"wss://api.myiquaapp.com{ws_uri}"
+            )
+        return None
+
+    def _fetch_websocket_uri(self) -> Optional[str]:
+        """Fetch the WebSocket URI without hiding API errors."""
+        device_id = self._get_device_id()
+        response = self._request("GET", f"/devices/{device_id}/live")
+        return response.json().get("websocket_uri")
 
     def _run_websocket_thread(self):
         """Run WebSocket client in a separate thread."""
@@ -417,20 +448,44 @@ class IquaSoftener:
 
     async def _websocket_client(self):
         """WebSocket client coroutine."""
+        self._websocket_task = asyncio.current_task()
         while self._websocket_running:
             try:
                 # Get WebSocket URI
                 ws_uri = await self._get_websocket_uri()
-                if not ws_uri:
-                    await asyncio.sleep(30)
-                    continue
+            except IquaRateLimitException as err:
+                delay = max(err.retry_after, self.rate_limit_cooldown_remaining)
+                logger.warning(
+                    "iQua API rate limited the WebSocket URI request; retrying in %.1f seconds",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            except Exception as err:
+                logger.warning(
+                    "Failed to retrieve WebSocket URI; retrying in 30 seconds: %s",
+                    err,
+                )
+                await asyncio.sleep(30)
+                continue
 
-                full_uri = f"wss://api.myiquaapp.com{ws_uri}"
-                logger.info(f"Connecting to WebSocket: {full_uri}")
+            if not ws_uri:
+                logger.debug("iQua API returned no WebSocket URI; retrying in 30 seconds")
+                await asyncio.sleep(30)
+                continue
 
+            full_uri = (
+                ws_uri
+                if ws_uri.startswith(("ws://", "wss://"))
+                else f"wss://api.myiquaapp.com{ws_uri}"
+            )
+            # WebSocket URIs can contain access credentials in the query string.
+            safe_uri = urlsplit(full_uri)._replace(query="", fragment="").geturl()
+            logger.info("Connecting to WebSocket endpoint: %s", safe_uri)
+
+            try:
                 async with websockets.connect(full_uri) as websocket:
                     logger.info("WebSocket connected successfully")
-                    self._websocket_task = asyncio.current_task()
                     self._websocket_connected_at = time.time()
 
                     async for message in websocket:
@@ -442,35 +497,32 @@ class IquaSoftener:
                             connection_duration = time.time() - self._websocket_connected_at
                             if connection_duration >= self._websocket_max_duration:
                                 logger.info(
-                                    f"WebSocket connection duration ({connection_duration:.1f}s) "
-                                    f"exceeded max ({self._websocket_max_duration}s), reconnecting..."
+                                    "WebSocket connection duration (%.1fs) exceeded max (%ss); reconnecting",
+                                    connection_duration,
+                                    self._websocket_max_duration,
                                 )
                                 break
 
                         try:
                             data = json.loads(message)
                             await self._handle_websocket_message(data)
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"Failed to parse WebSocket message: {e}")
-                        except Exception as e:
-                            logger.error(f"Error handling WebSocket message: {e}")
-
-            except Exception as e:
-                logger.error(f"WebSocket connection error: {e}")
+                        except json.JSONDecodeError as err:
+                            logger.warning("Failed to parse WebSocket message: %s", err)
+                        except Exception as err:
+                            logger.error("Error handling WebSocket message: %s", err)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                logger.warning("WebSocket connection failed: %s", err)
                 self._websocket_connected_at = None
                 if self._websocket_running:
-                    await asyncio.sleep(10)  # Wait before reconnecting
+                    logger.debug("Retrying WebSocket connection in 10 seconds")
+                    await asyncio.sleep(10)
 
     async def _get_websocket_uri(self) -> Optional[str]:
-        """Get WebSocket URI from the API."""
-        try:
-            device_id = self._get_device_id()
-            response = self._request("GET", f"/devices/{device_id}/live")
-            data = response.json()
-            return data.get("websocket_uri")
-        except Exception as e:
-            logger.error(f"Failed to get WebSocket URI: {e}")
-            return None
+        """Get WebSocket URI without blocking the WebSocket event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._fetch_websocket_uri)
 
     async def _handle_websocket_message(self, data: Dict[str, Any]):
         """Handle incoming WebSocket message."""
@@ -534,39 +586,38 @@ class IquaSoftener:
 
     def _get_device_id(self) -> str:
         """Get the device ID for the configured serial number."""
-        if self._device_id is not None:
-            return self._device_id
+        with self._api_lock:
+            if self._device_id is not None:
+                return self._device_id
 
-        # Get all devices and find the one with matching serial number
-        devices = self._get_devices()
-        for device in devices:
-            props = device.get("properties", {})
-            
-            # Check device_serial_number field if provided
-            if self._device_serial_number:
-                device_serial = props.get("serial_number", {}).get("value")
-                if device_serial == self._device_serial_number:
-                    self._device_id = device["id"]
-                    return self._device_id
-            
-            # Check product_serial_number field if provided
-            if self._product_serial_number:
-                product_serial = props.get("product_serial_number", {}).get("value")
-                if product_serial == self._product_serial_number:
-                    self._device_id = device["id"]
-                    return self._device_id
+            # Get all devices and find the one with matching serial number.
+            devices = self._get_devices()
+            for device in devices:
+                props = device.get("properties", {})
 
-        # Build error message based on what was provided
-        if self._device_serial_number and self._product_serial_number:
-            identifier = f"device serial number '{self._device_serial_number}' or product serial number '{self._product_serial_number}'"
-        elif self._device_serial_number:
-            identifier = f"device serial number '{self._device_serial_number}'"
-        else:
-            identifier = f"product serial number '{self._product_serial_number}'"
-        
-        raise IquaSoftenerException(
-            f"Device with {identifier} not found"
-        )
+                if self._device_serial_number:
+                    device_serial = props.get("serial_number", {}).get("value")
+                    if device_serial == self._device_serial_number:
+                        self._device_id = device["id"]
+                        return self._device_id
+
+                if self._product_serial_number:
+                    product_serial = props.get("product_serial_number", {}).get("value")
+                    if product_serial == self._product_serial_number:
+                        self._device_id = device["id"]
+                        return self._device_id
+
+            if self._device_serial_number and self._product_serial_number:
+                identifier = (
+                    f"device serial number '{self._device_serial_number}' or "
+                    f"product serial number '{self._product_serial_number}'"
+                )
+            elif self._device_serial_number:
+                identifier = f"device serial number '{self._device_serial_number}'"
+            else:
+                identifier = f"product serial number '{self._product_serial_number}'"
+
+            raise IquaSoftenerException(f"Device with {identifier} not found")
 
     def _get_devices(self) -> list:
         """Get list of all devices for the authenticated user."""
@@ -578,6 +629,78 @@ class IquaSoftener:
         """Ensure we have a session object."""
         if self._session is None:
             self._session = requests.Session()
+
+    @staticmethod
+    def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+        """Parse Retry-After as seconds or an HTTP date."""
+        if value is None:
+            return None
+
+        try:
+            return max(0.0, float(value.strip()))
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+    def _raise_if_rate_limited(self) -> None:
+        """Fail fast while the shared API cooldown is active."""
+        remaining = self.rate_limit_cooldown_remaining
+        if remaining > 0:
+            raise IquaRateLimitException(
+                f"iQua API cooldown is active; request was skipped "
+                f"(retry in {remaining:.1f} seconds)",
+                retry_after=remaining,
+            )
+
+    def _record_rate_limit(
+        self, response: requests.Response, operation: str
+    ) -> IquaRateLimitException:
+        """Start a shared cooldown after an HTTP 429 response."""
+        with self._rate_limit_lock:
+            now = time.monotonic()
+            headers = getattr(response, "headers", {}) or {}
+            retry_after = self._parse_retry_after(headers.get("Retry-After"))
+
+            exponent = min(self._rate_limit_count, 6)
+            base_delay = min(
+                RATE_LIMIT_MIN_BACKOFF_SECONDS * (2**exponent),
+                RATE_LIMIT_MAX_BACKOFF_SECONDS,
+            )
+            backoff_delay = min(
+                RATE_LIMIT_MAX_BACKOFF_SECONDS,
+                max(
+                    RATE_LIMIT_MIN_BACKOFF_SECONDS,
+                    base_delay * random.uniform(0.8, 1.2),
+                ),
+            )
+            delay = max(backoff_delay, retry_after or 0.0)
+            self._rate_limit_until = max(self._rate_limit_until, now + delay)
+            self._rate_limit_count += 1
+            remaining = max(0.0, self._rate_limit_until - now)
+
+            logger.warning(
+                "iQua API rate limited %s; pausing requests for %.1f seconds",
+                operation,
+                remaining,
+            )
+            return IquaRateLimitException(
+                f"iQua API rate limited {operation}; retry in {remaining:.1f} seconds",
+                retry_after=remaining,
+            )
+
+    def _record_success(self) -> None:
+        """Reset exponential backoff after an API request succeeds."""
+        with self._rate_limit_lock:
+            self._rate_limit_count = 0
+            self._rate_limit_until = 0.0
 
     def _set_tokens(self, access_token: str, refresh_token: Optional[str]):
         """Set authentication tokens and update session headers."""
@@ -608,78 +731,115 @@ class IquaSoftener:
 
     def _login(self) -> Dict[str, Any]:
         """Authenticate with the API and get tokens."""
-        self._ensure_session()
-        url = f"{self._api_base_url}/auth/login"
-        payload = {"email": self._username, "password": self._password}
-        try:
-            r = self._session.post(url, json=payload, timeout=15)
-        except requests.exceptions.RequestException as ex:
-            raise IquaSoftenerException(f"Exception on login request ({ex})")
+        with self._api_lock:
+            self._raise_if_rate_limited()
+            self._ensure_session()
+            url = f"{self._api_base_url}/auth/login"
+            payload = {"email": self._username, "password": self._password}
+            try:
+                r = self._session.post(url, json=payload, timeout=15)
+            except requests.exceptions.RequestException as ex:
+                raise IquaSoftenerException(f"Exception on login request ({ex})")
 
-        if r.status_code == 401:
-            raise IquaSoftenerException(f"Authentication error ({r.text})")
-        if r.status_code != 200:
-            raise IquaSoftenerException(f"Login failed: {r.status_code} {r.text}")
+            if r.status_code == 429:
+                raise self._record_rate_limit(r, "POST /auth/login")
+            if r.status_code == 401:
+                raise IquaSoftenerException(f"Authentication error ({r.text})")
+            if r.status_code != 200:
+                raise IquaSoftenerException(f"Login failed: {r.status_code} {r.text}")
 
-        data = r.json()
-        self._set_tokens(data.get("access_token"), data.get("refresh_token"))
-        self._user_id = data.get("user_id")
-        return data
+            self._record_success()
+            data = r.json()
+            self._set_tokens(data.get("access_token"), data.get("refresh_token"))
+            self._user_id = data.get("user_id")
+            return data
 
     def _refresh_access_token(self) -> Dict[str, Any]:
         """Refresh the access token using the refresh token."""
-        if not self._refresh_token:
-            raise IquaSoftenerException("No refresh token available")
+        with self._api_lock:
+            if not self._refresh_token:
+                raise IquaSoftenerException("No refresh token available")
 
-        self._ensure_session()
-        url = f"{self._api_base_url}/auth/refresh"
-        payload = {"refresh_token": self._refresh_token}
-        try:
-            r = self._session.post(url, json=payload, timeout=15)
-        except requests.exceptions.RequestException as ex:
-            raise IquaSoftenerException(f"Exception on token refresh ({ex})")
+            self._raise_if_rate_limited()
+            self._ensure_session()
+            url = f"{self._api_base_url}/auth/refresh"
+            payload = {"refresh_token": self._refresh_token}
+            try:
+                r = self._session.post(url, json=payload, timeout=15)
+            except requests.exceptions.RequestException as ex:
+                raise IquaSoftenerException(f"Exception on token refresh ({ex})")
 
-        if r.status_code != 200:
-            raise IquaSoftenerException(f"Refresh failed: {r.status_code} {r.text}")
+            if r.status_code == 429:
+                raise self._record_rate_limit(r, "POST /auth/refresh")
+            if r.status_code != 200:
+                raise IquaSoftenerException(f"Refresh failed: {r.status_code} {r.text}")
 
-        data = r.json()
-        self._set_tokens(data.get("access_token"), data.get("refresh_token"))
-        return data
+            self._record_success()
+            data = r.json()
+            self._set_tokens(data.get("access_token"), data.get("refresh_token"))
+            return data
 
     def _ensure_authenticated(self):
         """Ensure we have a valid authentication token."""
-        if self._is_token_expired():
+        with self._api_lock:
+            self._raise_if_rate_limited()
+            if not self._is_token_expired():
+                return
+
+            if not self._refresh_token:
+                self._login()
+                return
+
             try:
-                if self._refresh_token:
-                    self._refresh_access_token()
-                else:
-                    self._login()
-            except IquaSoftenerException:
+                self._refresh_access_token()
+            except IquaRateLimitException:
+                raise
+            except IquaSoftenerException as err:
+                logger.warning("Token refresh failed; falling back to login: %s", err)
                 self._login()
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         """Make an authenticated request to the API."""
-        self._ensure_authenticated()
-        self._ensure_session()
+        with self._api_lock:
+            self._raise_if_rate_limited()
+            self._ensure_authenticated()
+            self._ensure_session()
 
-        url = (
-            path
-            if path.startswith("http")
-            else f"{self._api_base_url.rstrip('/')}/{path.lstrip('/')}"
-        )
+            url = (
+                path
+                if path.startswith("http")
+                else f"{self._api_base_url.rstrip('/')}/{path.lstrip('/')}"
+            )
+            operation = f"{method.upper()} {urlsplit(url).path}"
 
-        r = self._session.request(method, url, timeout=20, **kwargs)
-        if r.status_code == 401 and self._refresh_token:
-            try:
-                self._refresh_access_token()
-                r = self._session.request(method, url, timeout=20, **kwargs)
-            except IquaSoftenerException:
-                self._login()
-                r = self._session.request(method, url, timeout=20, **kwargs)
+            def send_request() -> requests.Response:
+                response = self._session.request(method, url, timeout=20, **kwargs)
+                if response.status_code == 429:
+                    raise self._record_rate_limit(response, operation)
+                return response
 
-        if r.status_code != 200:
-            r.raise_for_status()
-        return r
+            response = send_request()
+            if response.status_code == 401 and self._refresh_token:
+                try:
+                    self._refresh_access_token()
+                except IquaRateLimitException:
+                    # A throttled refresh must not trigger a login or replay the
+                    # original request (especially for device commands).
+                    raise
+                except IquaSoftenerException as err:
+                    logger.warning(
+                        "Token refresh after an unauthorized API response failed; "
+                        "falling back to login: %s",
+                        err,
+                    )
+                    self._login()
+                response = send_request()
+
+            if response.status_code == 200:
+                self._record_success()
+            else:
+                response.raise_for_status()
+            return response
 
     def _get_device_detail(self, device_id: str) -> dict:
         """Get detailed device information."""

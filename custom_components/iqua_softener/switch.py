@@ -6,7 +6,11 @@ from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.components.switch import SwitchEntity
 
-from .vendor.iqua_softener import IquaSoftenerData, IquaSoftenerException
+from .vendor.iqua_softener import (
+    IquaSoftenerData,
+    IquaSoftenerException,
+    IquaRateLimitException,
+)
 
 from homeassistant import config_entries, core
 from .const import DOMAIN, CONF_DEVICE_SERIAL_NUMBER, CONF_PRODUCT_SERIAL_NUMBER, SWITCH_OPTIMISTIC_TIMEOUT
@@ -60,7 +64,12 @@ async def _check_water_shutoff_valve_available(coordinator: IquaSoftenerCoordina
         )
         _LOGGER.debug("Water shutoff valve availability check: %s", has_valve)
         return has_valve
-        
+    except IquaRateLimitException as err:
+        _LOGGER.warning(
+            "Could not check water shutoff valve support while the iQua API is cooling down: %s",
+            err,
+        )
+        return False
     except Exception as err:
         _LOGGER.error("Error checking water shutoff valve availability: %s", err)
         return False
@@ -137,6 +146,14 @@ class IquaSoftenerWaterShutoffValveSwitch(SwitchEntity, CoordinatorEntity):
             await asyncio.sleep(3)
             # Request an immediate update after the action
             await self.coordinator.async_request_refresh()
+        except IquaRateLimitException as err:
+            self._optimistic_state = None
+            self._optimistic_until = None
+            _LOGGER.warning(
+                "iQua API rate limited the valve command; it was not retried: %s",
+                err,
+            )
+            raise
         except IquaSoftenerException as err:
             # Clear optimistic state on error
             self._optimistic_state = None
@@ -162,6 +179,14 @@ class IquaSoftenerWaterShutoffValveSwitch(SwitchEntity, CoordinatorEntity):
             await asyncio.sleep(3)
             # Request an immediate update after the action
             await self.coordinator.async_request_refresh()
+        except IquaRateLimitException as err:
+            self._optimistic_state = None
+            self._optimistic_until = None
+            _LOGGER.warning(
+                "iQua API rate limited the valve command; it was not retried: %s",
+                err,
+            )
+            raise
         except IquaSoftenerException as err:
             # Clear optimistic state on error
             self._optimistic_state = None

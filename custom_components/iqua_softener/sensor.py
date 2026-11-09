@@ -16,6 +16,7 @@ from .vendor.iqua_softener import (
     IquaSoftenerData,
     IquaSoftenerVolumeUnit,
     IquaSoftenerException,
+    IquaRateLimitException,
 )
 
 from homeassistant import config_entries, core
@@ -205,11 +206,12 @@ class IquaSoftenerCoordinator(DataUpdateCoordinator):
         enable_websocket: bool = True,
         config_data: dict = None,
     ):
+        self._normal_update_interval = timedelta(minutes=update_interval_minutes)
         super().__init__(
             hass,
             _LOGGER,
             name="Iqua Softener",
-            update_interval=timedelta(minutes=update_interval_minutes),
+            update_interval=self._normal_update_interval,
         )
         self._iqua_softener = iqua_softener
         self._enable_websocket = enable_websocket
@@ -291,6 +293,8 @@ class IquaSoftenerCoordinator(DataUpdateCoordinator):
             if data is None:
                 _LOGGER.error("API returned None data - sensors will show as unknown")
                 raise UpdateFailed("API returned no data")
+
+            self.update_interval = self._normal_update_interval
             
             # Log timezone information for debugging
             if hasattr(data, 'device_date_time') and data.device_date_time:
@@ -340,6 +344,20 @@ class IquaSoftenerCoordinator(DataUpdateCoordinator):
             else:
                 _LOGGER.error("Unexpected TypeError in iQua API call: %s", err)
                 raise UpdateFailed(f"Unexpected error: {err}")
+        except IquaRateLimitException as err:
+            retry_after = max(
+                err.retry_after,
+                self._iqua_softener.rate_limit_cooldown_remaining,
+            )
+            retry_after = max(1.0, retry_after)
+            self.update_interval = timedelta(seconds=retry_after)
+            _LOGGER.warning(
+                "iQua API rate limited the coordinator; retrying in %.1f seconds",
+                retry_after,
+            )
+            raise UpdateFailed(
+                f"iQua API rate limited; retrying in {retry_after:.1f} seconds"
+            ) from err
         except IquaSoftenerException as err:
             _LOGGER.error("API data fetch failed: %s", err)
             raise UpdateFailed(f"Get data failed: {err}")

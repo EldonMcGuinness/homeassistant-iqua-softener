@@ -4,7 +4,11 @@ from typing import Any, Dict, Optional
 from homeassistant import config_entries
 import voluptuous as vol
 
-from .vendor.iqua_softener import IquaSoftener, IquaSoftenerException
+from .vendor.iqua_softener import (
+    IquaSoftener,
+    IquaSoftenerException,
+    IquaRateLimitException,
+)
 from .const import (
     DOMAIN,
     CONF_USERNAME,
@@ -109,6 +113,13 @@ class IquaSoftenerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.info("Authentication validation successful for user: %s", username)
             return {"success": True, "error": None}
             
+        except IquaRateLimitException as err:
+            _LOGGER.warning(
+                "iQua API rate limited during credential validation; credentials were not rejected (retry in %.1f seconds)",
+                err.retry_after,
+            )
+            return {"success": False, "error": "cannot_connect"}
+
         except IquaSoftenerException as err:
             error_msg = str(err).lower()
             _LOGGER.error("Authentication validation failed: %s", err)
